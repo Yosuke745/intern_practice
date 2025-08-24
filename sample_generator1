@@ -1,0 +1,326 @@
+# Cell 0: ensure parquet support
+!pip -q install pyarrow
+
+# Cell 1: Setup & utils
+import os, zipfile
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+
+RNG = np.random.default_rng(42)
+
+def daterange(start_date: datetime, days: int):
+    return [start_date + timedelta(days=i) for i in range(days)]
+
+def poisson_clip(mean: float, rng=RNG):
+    return max(0, rng.poisson(mean))
+
+def clamp01(x: float, hi: float = 0.99):
+    return max(0.0, min(hi, x))
+
+# Cell 2: Config (10k users, 13 weeks; Parquet; multi-campaign)
+
+from datetime import datetime, timedelta
+import numpy as np
+import os
+
+START_DATE = datetime(2025, 6, 1)
+N_DAYS     = 13 * 7            # 13週間 = 91日
+N_USERS    = 10_000
+
+# リテンション（週0..7 以降は末尾値を使用）
+RETENTION_CURVE = [1.00, 0.42, 0.35, 0.32, 0.30, 0.28, 0.27, 0.26]
+
+# 属性補正（週次の生存率に直掛け：若年女性を弱める）
+ATTR_RETENTION_MULT = {
+    ("10-19","F"): 0.60,
+    ("20-29","F"): 0.70,
+}
+
+# ヘビーユーザー依存
+HEAVY_USER_SHARE       = 0.20
+HEAVY_ACTIVE_MULT      = 1.00   # 週の生存判定には影響させない
+HEAVY_SESSION_MULT     = 3.50
+HEAVY_PV_PER_SESS_MULT = 6.80
+
+# 行動量（ライト層基準）
+AVG_SESSIONS_PER_ACTIVE_DAY = 1.00
+AVG_PV_PER_SESSION          = 2.00
+
+# カテゴリ＆嗜好
+CATEGORIES = ["ent","sports","economy","tech","life"]
+CATEGORY_BASE_WEIGHTS = np.array([0.35, 0.25, 0.15, 0.15, 0.10], dtype=float)
+ATTR_CATEGORY_MULT = {
+    ("20-29","F"): {"ent": 1.20},
+    ("30-39","M"): {"sports": 1.20},
+}
+
+# 時間帯＆週末（朝/昼/夕/夜 = 0.40/0.25/0.20/0.15）
+DAYPART_WEIGHTS = np.array([0.40, 0.25, 0.20, 0.15], dtype=float)
+DAYPART_WINDOWS = [(6,10), (11,14), (15,18), (19,23)]
+WEEKEND_ACTIVE_MULT = 1.05
+
+# サインアップの右肩上がり（弱め）
+DAILY_NEW_USER_TREND = 0.001
+
+# 週内の活動日数（平均）
+MEAN_ACTIVE_DAYS_LIGHT = 1.2
+MEAN_ACTIVE_DAYS_HEAVY = 3.0
+
+# --- 複数キャンペーン設定（開始・終了は “日次インデックス” で指定）---
+def day_index(dt):  # 0=2025-06-01
+    return (dt - START_DATE).days
+
+CAMPAIGNS = [
+    # 6/21〜6/27（どちらも含む）
+    {"start": day_index(datetime(2025,6,21)), "end": day_index(datetime(2025,6,27)),
+     "signup_boost": 2.0, "pv_boost": 1.2},
+    # 7/21〜7/27（どちらも含む）
+    {"start": day_index(datetime(2025,7,21)), "end": day_index(datetime(2025,7,27)),
+     "signup_boost": 2.0, "pv_boost": 1.2},
+]
+# 参考（インデックス）：6/21=20, 6/27=26, 7/21=50, 7/27=56
+
+# 出力
+OUT_DIR = "sfd_out_parquet"
+os.makedirs(OUT_DIR, exist_ok=True)
+ZIP_NAME = f"sfd_13w_10k_parquet.zip"
+
+# Cell 3: Generate users & articles (with multi-campaign signup boost)
+
+import pandas as pd
+import numpy as np
+
+dates = [START_DATE + timedelta(days=i) for i in range(N_DAYS)]
+
+AGE_BUCKETS = ["10-19","20-29","30-39","40-49","50-59","60+"]
+AGE_WEIGHTS = np.array([0.08, 0.24, 0.24, 0.22, 0.16, 0.06], dtype=float)
+GENDERS     = ["M","F"]
+GENDER_P    = np.array([0.5, 0.5], dtype=float)
+
+RNG = np.random.default_rng(42)
+
+users = pd.DataFrame({
+    "user_id": np.arange(1, N_USERS+1, dtype=np.int32),
+    "age_group": RNG.choice(AGE_BUCKETS, size=N_USERS, p=(AGE_WEIGHTS/AGE_WEIGHTS.sum())),
+    "gender":    RNG.choice(GENDERS,     size=N_USERS, p=(GENDER_P/GENDER_P.sum())),
+})
+
+def signup_boost_for_day_index(d):
+    for c in CAMPAIGNS:
+        if c["start"] <= d <= c["end"]:
+            return c["signup_boost"]
+    return 1.0
+
+raw_w = np.array([
+    (1.0 + DAILY_NEW_USER_TREND * d) * signup_boost_for_day_index(d)
+    for d in range(N_DAYS)
+], dtype=float)
+p_signup = raw_w / raw_w.sum()
+daily_new = RNG.multinomial(N_USERS, p_signup)
+
+signup_dates = []
+for d, cnt in enumerate(daily_new):
+    signup_dates.extend([dates[d]] * cnt)
+RNG.shuffle(signup_dates)
+users["signup_date"] = pd.to_datetime(signup_dates)
+
+# ヘビー指定
+users["is_heavy"] = (RNG.random(N_USERS) < HEAVY_USER_SHARE)
+
+# 記事
+N_ARTICLES = 10_000
+cat_p = CATEGORY_BASE_WEIGHTS / CATEGORY_BASE_WEIGHTS.sum()
+articles = pd.DataFrame({
+    "article_id": np.arange(1, N_ARTICLES+1, dtype=np.int32),
+    "category":   RNG.choice(CATEGORIES, size=N_ARTICLES, p=cat_p)
+})
+
+# 型最適化＆保存
+users["age_group"] = users["age_group"].astype("category")
+users["gender"]    = users["gender"].astype("category")
+articles["category"] = articles["category"].astype("category")
+
+users_path    = os.path.join(OUT_DIR, "users.parquet")
+articles_path = os.path.join(OUT_DIR, "articles.parquet")
+users.to_parquet(users_path, index=False)
+articles.to_parquet(articles_path, index=False)
+
+users.head(), articles["category"].value_counts(normalize=True).sort_index()
+
+# Cell 4: Generate sessions & pageviews (weekly-driven; multi-campaign pv boost)
+
+import pandas as pd
+import numpy as np
+
+def pick_daypart(rng=RNG):
+    idx = rng.choice(len(DAYPART_WEIGHTS), p=DAYPART_WEIGHTS / DAYPART_WEIGHTS.sum())
+    lo, hi = DAYPART_WINDOWS[int(idx)]
+    hour   = int(rng.integers(lo, hi + 1))
+    minute = int(rng.integers(0, 60))
+    return hour, minute
+
+# 嗜好補正マップ
+attr_cat_mult = {}
+for key, mults in ATTR_CATEGORY_MULT.items():
+    base = {c: 1.0 for c in CATEGORIES}
+    base.update(mults)
+    attr_cat_mult[key] = base
+
+# カテゴリ→記事プール
+cat_to_articles = {
+    c: articles.loc[articles["category"] == c, "article_id"].to_numpy()
+    for c in CATEGORIES
+}
+
+def pv_boost_for_day_index(d):
+    # 重複キャンペーンがあれば最大値を採用（通常は非重複）
+    b = 1.0
+    for c in CAMPAIGNS:
+        if c["start"] <= d <= c["end"]:
+            b = max(b, c["pv_boost"])
+    return b
+
+sessions_rows  = []
+pageviews_rows = []
+session_id = 1
+pv_id      = 1
+
+dates_arr = np.array(dates)
+
+for _, u in users.iterrows():
+    uid   = int(u["user_id"])
+    age   = u["age_group"]
+    g     = u["gender"]
+    heavy = bool(u["is_heavy"])
+    sgnup = pd.to_datetime(u["signup_date"])
+
+    d_idx = 0
+    while d_idx < len(dates_arr):
+        day = pd.Timestamp(dates_arr[d_idx])
+        if day < sgnup:
+            d_idx += 1
+            continue
+
+        week_no = (day - sgnup).days // 7
+        p_week = RETENTION_CURVE[week_no] if week_no < len(RETENTION_CURVE) else RETENTION_CURVE[-1]
+        if week_no >= 1:
+            key = (age, g)
+            if key in ATTR_RETENTION_MULT:
+                p_week *= ATTR_RETENTION_MULT[key]
+
+        active_this_week = (RNG.random() < clamp01(p_week))
+
+        week_start = sgnup + pd.Timedelta(days=int(max(0, week_no)*7))
+        week_end   = week_start + pd.Timedelta(days=7)
+
+        while d_idx < len(dates_arr) and pd.Timestamp(dates_arr[d_idx]) < week_start:
+            d_idx += 1
+
+        if not active_this_week:
+            while d_idx < len(dates_arr) and pd.Timestamp(dates_arr[d_idx]) < week_end:
+                d_idx += 1
+            continue
+
+        # 週内の活動日選び（週末重み）
+        weights = np.array([
+            WEEKEND_ACTIVE_MULT if (week_start + pd.Timedelta(days=i)).weekday() >= 5 else 1.0
+            for i in range(7)
+        ], dtype=float)
+        weights /= weights.sum()
+
+        mean_days = MEAN_ACTIVE_DAYS_HEAVY if heavy else MEAN_ACTIVE_DAYS_LIGHT
+        n_active_days = max(1, int(RNG.poisson(mean_days)))
+        active_offsets = set(RNG.choice(np.arange(7), size=min(n_active_days,7), replace=False, p=weights))
+
+        # 週内日ループ
+        while d_idx < len(dates_arr) and pd.Timestamp(dates_arr[d_idx]) < week_end:
+            cur_day = pd.Timestamp(dates_arr[d_idx])
+            offset  = (cur_day - week_start).days
+            if offset in active_offsets:
+                # セッション
+                mean_sessions = AVG_SESSIONS_PER_ACTIVE_DAY * (HEAVY_SESSION_MULT if heavy else 1.0)
+                n_sessions = max(1, poisson_clip(mean_sessions, rng=RNG))
+                for _ in range(n_sessions):
+                    h, m = pick_daypart(RNG)
+                    start  = cur_day.replace(hour=h, minute=m, second=0, microsecond=0)
+                    dur_min = max(1, int(RNG.normal(6.0, 2.0)))
+                    end    = start + pd.Timedelta(minutes=dur_min)
+
+                    device = RNG.choice(["iOS","Android","Web"], p=[0.45, 0.45, 0.10])
+                    sessions_rows.append((session_id, uid, start, end, device, int(week_no)))
+
+                    # --- PV生成（複数キャンペーンのPVブースト）---
+                    day_idx = (cur_day - START_DATE).days  # 0=2025-06-01
+                    base_pv_mean = AVG_PV_PER_SESSION * pv_boost_for_day_index(day_idx)
+                    pv_mean = base_pv_mean * (HEAVY_PV_PER_SESS_MULT if heavy else 1.0)
+                    n_pv = max(1, poisson_clip(pv_mean, rng=RNG))
+
+                    # カテゴリ分布（属性嗜好）
+                    cat_w = CATEGORY_BASE_WEIGHTS.copy()
+                    key   = (age, g)
+                    if key in attr_cat_mult:
+                        mult = np.array([attr_cat_mult[key][c] for c in CATEGORIES], dtype=float)
+                        cat_w = cat_w * mult
+                    cat_p_user = cat_w / cat_w.sum()
+
+                    for __ in range(n_pv):
+                        cat = RNG.choice(CATEGORIES, p=cat_p_user)
+                        pool = cat_to_articles.get(cat)
+                        aid  = int(RNG.choice(pool)) if pool is not None and len(pool) else int(RNG.integers(1, len(articles)+1))
+                        ts   = start + pd.Timedelta(minutes=int(RNG.integers(0, max(1, dur_min))))
+                        pageviews_rows.append((pv_id, session_id, uid, aid, ts, int(week_no)))
+                        pv_id += 1
+
+                    session_id += 1
+            d_idx += 1
+
+sessions = pd.DataFrame(sessions_rows, columns=["session_id","user_id","session_start","session_end","device","week_no"])
+pageviews = pd.DataFrame(pageviews_rows, columns=["pv_id","session_id","user_id","article_id","ts","week_no"])
+
+# Parquetへ保存（1ファイルずつ）
+sessions_path  = os.path.join(OUT_DIR, "sessions.parquet")
+pageviews_path = os.path.join(OUT_DIR, "pageviews.parquet")
+sessions.to_parquet(sessions_path, index=False)
+pageviews.to_parquet(pageviews_path, index=False)
+
+print("Saved:")
+for p in [users_path, articles_path, sessions_path, pageviews_path]:
+    print(" -", p)
+print("Rows -> users:", len(users), "articles:", len(articles),
+      "sessions:", len(sessions), "pageviews:", len(pageviews))
+
+# Cell 5: Archive into a single ZIP
+zip_path = os.path.join(OUT_DIR, ZIP_NAME)
+with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    for fn in ["users.parquet", "articles.parquet", "sessions.parquet", "pageviews.parquet"]:
+        zf.write(os.path.join(OUT_DIR, fn), arcname=fn)
+print("Created ZIP:", zip_path)
+
+# Cell 6: Quick sanity from Parquet (right-censoring handled)
+import pandas as pd
+
+users      = pd.read_parquet(os.path.join(OUT_DIR, "users.parquet"))
+articles   = pd.read_parquet(os.path.join(OUT_DIR, "articles.parquet"))
+sessions   = pd.read_parquet(os.path.join(OUT_DIR, "sessions.parquet"))
+pageviews  = pd.read_parquet(os.path.join(OUT_DIR, "pageviews.parquet"))
+
+# Top20% PV share
+pv_per_user = pageviews.groupby("user_id").size().sort_values(ascending=False)
+k = max(1, int(len(pv_per_user)*0.20))
+top20_share = pv_per_user.iloc[:k].sum()/pv_per_user.sum()
+
+# W1 retention (signup-based, W1観測可能者に限定)
+last_obs = pageviews["ts"].max().floor("D")
+eligible = users.loc[users["signup_date"] <= (last_obs - pd.Timedelta(days=14)), "user_id"]
+pv_u = pageviews.merge(users[["user_id","signup_date"]], on="user_id", how="left")
+pv_u["date"] = pv_u["ts"].dt.floor("D")
+pv_u["w_no"] = ((pv_u["date"] - pv_u["signup_date"]).dt.days // 7).astype(int)
+wk = pv_u[["user_id","w_no"]].drop_duplicates()
+wk = wk[wk["user_id"].isin(eligible)]
+w0 = set(wk.loc[wk["w_no"]==0,"user_id"]); w1 = set(wk.loc[wk["w_no"]==1,"user_id"])
+w1_rate = len(w0 & w1) / len(w0) if w0 else float("nan")
+
+print(f"Top 20% PV share ≈ {top20_share:.3f}")
+print(f"Week1 retention (overall) ≈ {w1_rate:.3f}")
+print("ZIP to upload:", os.path.join(OUT_DIR, ZIP_NAME))
